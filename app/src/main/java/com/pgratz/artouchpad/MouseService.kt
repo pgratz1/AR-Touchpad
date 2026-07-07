@@ -40,6 +40,9 @@ class MouseService : IMouseService.Stub() {
     private var cursorY = 540f
 
     private var uinputReady = false
+    // Cached descriptor string for our uinput device; set after InputReader registers it.
+    // Used by associateDeviceToDisplay() to pin the cursor to the external display.
+    private var uinputDescriptor: String? = null
 
     // Sub-pixel accumulators: carry fractional remainders between calls so that
     // slow movements (e.g. 0.4 px/frame) accumulate cleanly instead of truncating
@@ -48,7 +51,7 @@ class MouseService : IMouseService.Stub() {
     private var accumY = 0f
     private var accumScroll = 0f
 
-    // Reflection handles for display-targeted key injection.
+    // Reflection handles for display-targeted key injection and device-display association.
     // injectInputEvent(event, mode) on InputManagerGlobal respects the displayId
     // embedded in the event, routing the key to the focused window on that display.
     private val imgClass by lazy {
@@ -66,6 +69,20 @@ class MouseService : IMouseService.Stub() {
             android.view.InputEvent::class.java
                 .getDeclaredMethod("setDisplayId", Int::class.javaPrimitiveType)
                 .also { it.isAccessible = true }
+        }.getOrNull()
+    }
+    private val imgGetDeviceIds by lazy {
+        runCatching { imgClass?.getMethod("getInputDeviceIds") }.getOrNull()
+    }
+    private val imgGetDevice by lazy {
+        runCatching {
+            imgClass?.getMethod("getInputDevice", Int::class.javaPrimitiveType)
+        }.getOrNull()
+    }
+    private val imgSetDisplayAssoc by lazy {
+        runCatching {
+            imgClass?.getMethod("setInputDeviceDisplayAssociation",
+                String::class.java, Int::class.javaPrimitiveType)
         }.getOrNull()
     }
 
@@ -107,10 +124,46 @@ class MouseService : IMouseService.Stub() {
 
             Thread.sleep(400) // give InputReader time to register the device
             uinputReady = true
-            Log.i(TAG, "uinput device ready")
+            uinputDescriptor = findUinputDescriptor()
+            Log.i(TAG, "uinput device ready, descriptor=$uinputDescriptor")
         } catch (e: Exception) {
             Log.e(TAG, "initUinput failed: $e")
         }
+    }
+
+    // Scans all registered input devices via InputManagerGlobal and returns the descriptor
+    // of the one named "AR Touchpad Mouse". Returns null if not found or reflection fails.
+    private fun findUinputDescriptor(): String? = runCatching {
+        val instance = imgInstance ?: return@runCatching null
+        val ids = imgGetDeviceIds?.invoke(instance) as? IntArray ?: return@runCatching null
+        val getDevice = imgGetDevice ?: return@runCatching null
+        ids.mapNotNull { id ->
+            (getDevice.invoke(instance, id) as? android.view.InputDevice)
+                ?.takeIf { it.name == "AR Touchpad Mouse" }
+                ?.descriptor
+        }.firstOrNull()
+    }.getOrNull()
+
+    // Tells Android's InputReader to route this uinput device's cursor to targetDisplayId.
+    // Falls back to accessing the raw IInputManager binder via the mIm field if
+    // setInputDeviceDisplayAssociation is not exposed directly on InputManagerGlobal.
+    private fun associateDeviceToDisplay(descriptor: String, targetDisplayId: Int) {
+        runCatching {
+            val instance = imgInstance ?: return
+            val method = imgSetDisplayAssoc ?: run {
+                // Fallback: call through the raw IInputManager binder held by InputManagerGlobal.
+                val mImField = imgClass?.getDeclaredField("mIm")
+                    ?.also { it.isAccessible = true }
+                val iim = mImField?.get(instance) ?: return
+                val iimMethod = iim.javaClass.getMethod("setInputDeviceDisplayAssociation",
+                    String::class.java, Int::class.javaPrimitiveType)
+                iimMethod.invoke(iim, descriptor, targetDisplayId)
+                Log.i(TAG, "associated uinput device (via mIm) to display $targetDisplayId")
+                return
+            }
+            method.invoke(instance, descriptor, targetDisplayId)
+            Log.i(TAG, "associated uinput device to display $targetDisplayId")
+        }.onFailure { Log.w(TAG, "associateDeviceToDisplay failed: $it") }
     }
 
     // Writes a single struct input_event{type, code, value} to the open uinput fd via JNI.
@@ -119,7 +172,9 @@ class MouseService : IMouseService.Stub() {
     private fun sync() = ev(EV_SYN, SYN_REPORT, 0)
 
     // Stores the target display id and pixel dimensions; resets cursor to center and clears
-    // accumulators. Sends a 1-px nudge to wake the OS cursor on the new display.
+    // accumulators. Associates the uinput device to the target display so that REL_X/Y events
+    // move the cursor on the glasses screen instead of the phone screen. Sends a 1-px nudge
+    // to wake the OS cursor on the new display.
     override fun setDisplay(id: Int, width: Int, height: Int) {
         displayId = id
         displayWidth = width
@@ -129,6 +184,10 @@ class MouseService : IMouseService.Stub() {
         accumX = 0f
         accumY = 0f
         accumScroll = 0f
+
+        // Pin the uinput device to this display so cursor movement lands on the glasses screen.
+        // Without this, Android may default the virtual mouse to the phone's display on some setups.
+        uinputDescriptor?.let { associateDeviceToDisplay(it, id) }
 
         // Nudge the pointer to wake the cursor.
         if (uinputReady) {
