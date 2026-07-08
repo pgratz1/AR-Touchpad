@@ -49,7 +49,8 @@ class MouseService : IMouseService.Stub() {
     // to zero every frame and producing sudden jumps.
     private var accumX = 0f
     private var accumY = 0f
-    private var accumScroll = 0f
+    private var accumScrollX = 0f
+    private var accumScrollY = 0f
 
     // Reflection handles for display-targeted key injection and device-display association.
     // injectInputEvent(event, mode) on InputManagerGlobal respects the displayId
@@ -83,6 +84,26 @@ class MouseService : IMouseService.Stub() {
         runCatching {
             imgClass?.getMethod("setInputDeviceDisplayAssociation",
                 String::class.java, Int::class.javaPrimitiveType)
+        }.getOrNull()
+    }
+
+    // Reflection handles for IWindowManager.setDisplayImePolicy — controls which display
+    // shows the IME for fields focused on a given display. Shell uid holds the required
+    // INTERNAL_SYSTEM_WINDOW permission, so the binder call passes the WMS check.
+    private val iwmInstance by lazy {
+        runCatching {
+            val binder = Class.forName("android.os.ServiceManager")
+                .getMethod("getService", String::class.java)
+                .invoke(null, "window") as android.os.IBinder
+            Class.forName("android.view.IWindowManager\$Stub")
+                .getMethod("asInterface", android.os.IBinder::class.java)
+                .invoke(null, binder)
+        }.getOrNull()
+    }
+    private val iwmSetImePolicy by lazy {
+        runCatching {
+            iwmInstance?.javaClass?.getMethod("setDisplayImePolicy",
+                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
         }.getOrNull()
     }
 
@@ -137,7 +158,7 @@ class MouseService : IMouseService.Stub() {
         val instance = imgInstance ?: return@runCatching null
         val ids = imgGetDeviceIds?.invoke(instance) as? IntArray ?: return@runCatching null
         val getDevice = imgGetDevice ?: return@runCatching null
-        ids.mapNotNull { id ->
+        ids.toList().mapNotNull { id ->
             (getDevice.invoke(instance, id) as? android.view.InputDevice)
                 ?.takeIf { it.name == "AR Touchpad Mouse" }
                 ?.descriptor
@@ -183,7 +204,8 @@ class MouseService : IMouseService.Stub() {
         cursorY = height / 2f
         accumX = 0f
         accumY = 0f
-        accumScroll = 0f
+        accumScrollX = 0f
+        accumScrollY = 0f
 
         // Pin the uinput device to this display so cursor movement lands on the glasses screen.
         // Without this, Android may default the virtual mouse to the phone's display on some setups.
@@ -282,19 +304,22 @@ class MouseService : IMouseService.Stub() {
         }
     }
 
-    // Input: dy = vertical finger-pixel delta (positive = fingers moving down).
-    // Converts dy to wheel detents at 20 px/detent using accumScroll; emits REL_WHEEL only
-    // for whole detents, carrying the sub-detent remainder forward. dx is unused (reserved).
+    // Input: (dx, dy) finger-pixel deltas (positive = fingers moving right/down).
+    // Converts each axis to wheel detents at 20 px/detent using accumScrollX/Y; emits
+    // REL_WHEEL/REL_HWHEEL only for whole detents, carrying sub-detent remainders forward.
     override fun scroll(dx: Float, dy: Float) {
         if (!uinputReady) return
         // 20px of finger movement = 1 wheel detent (adjustable via scrollSpeed in ViewModel).
-        accumScroll += dy / 20f
-        val steps = accumScroll.toInt()
-        if (steps != 0) {
-            accumScroll -= steps
-            ev(EV_REL, REL_WHEEL, -steps)
-            sync()
-        }
+        accumScrollX += dx / 20f
+        accumScrollY += dy / 20f
+        val stepsX = accumScrollX.toInt()
+        val stepsY = accumScrollY.toInt()
+        if (stepsX == 0 && stepsY == 0) return
+        accumScrollX -= stepsX
+        accumScrollY -= stepsY
+        if (stepsY != 0) ev(EV_REL, REL_WHEEL, -stepsY)
+        if (stepsX != 0) ev(EV_REL, REL_HWHEEL, -stepsX)
+        sync()
     }
 
     // Input: desired font scale (clamped internally to 0.85–1.5).
@@ -309,6 +334,24 @@ class MouseService : IMouseService.Stub() {
             Log.d(TAG, "setFontScale $clamped")
         } catch (e: Exception) {
             Log.e(TAG, "setFontScale failed: $e")
+        }
+    }
+
+    // Input: displayId and IME policy (0 = local, 1 = fallback, 2 = hide).
+    // Calls IWindowManager.setDisplayImePolicy via reflection (there is no `wm` shell
+    // subcommand for this). With policy 1 (fallback), a field focused on the target display
+    // shows its IME on the default display (the phone) while the InputConnection stays with
+    // the field — DeX-style typing. Returns false when unsupported on this build.
+    override fun setImePolicy(displayId: Int, policy: Int): Boolean {
+        val iwm = iwmInstance ?: run { Log.e(TAG, "IWindowManager unavailable"); return false }
+        val method = iwmSetImePolicy ?: run { Log.e(TAG, "setDisplayImePolicy unavailable"); return false }
+        return runCatching {
+            method.invoke(iwm, displayId, policy)
+            Log.i(TAG, "setDisplayImePolicy display=$displayId policy=$policy")
+            true
+        }.getOrElse {
+            Log.w(TAG, "setDisplayImePolicy failed: $it")
+            false
         }
     }
 

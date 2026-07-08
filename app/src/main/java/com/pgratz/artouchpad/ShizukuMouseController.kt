@@ -37,7 +37,7 @@ class ShizukuMouseController {
     )
         .processNameSuffix("mouse")
         .daemon(false)
-        .version(16)  // bumped — ctrlScroll for content-level pinch zoom (Ctrl+scroll MotionEvent)
+        .version(17)  // bumped — setImePolicy for DeX-style phone-side keyboard
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -166,4 +166,9 @@ class ShizukuMouseController {
 
     // Injects a Ctrl+scroll MotionEvent for content-level zoom in Chrome/WebView apps.
     fun ctrlScroll(amount: Float) { runCatching { service?.ctrlScroll(amount) } }
+
+    // Sets the per-display IME policy (0 = local, 1 = fallback → keyboard on phone, 2 = hide).
+    // Returns false if the service isn't bound or the wm command isn't supported on this build.
+    fun setImePolicy(displayId: Int, policy: Int): Boolean =
+        runCatching { service?.setImePolicy(displayId, policy) ?: false }.getOrDefault(false)
 }

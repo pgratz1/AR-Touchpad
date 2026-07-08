@@ -21,6 +21,7 @@ import android.util.DisplayMetrics
 import android.view.Display
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -29,6 +30,10 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 enum class TouchMode { IDLE, CURSOR, SCROLL, SELECT }
+
+// WindowManager DISPLAY_IME_POLICY_* values, passed to IWindowManager.setDisplayImePolicy.
+private const val IME_POLICY_LOCAL = 0     // IME on the display that owns the focused field
+private const val IME_POLICY_FALLBACK = 1  // IME on the default display (phone) — DeX-style
 
 data class DisplayInfo(val id: Int, val name: String, val width: Int, val height: Int)
 
@@ -41,12 +46,17 @@ data class TouchpadState(
     val targetDisplay: DisplayInfo? = null,
     val cursorX: Float = 0f,
     val cursorY: Float = 0f,
-    val sensitivity: Float = 1.2f,
+    val sensitivity: Float = 0.5f,
     val scrollSpeed: Float = 0.8f,
     val naturalScroll: Boolean = false,
     val showSettings: Boolean = false,
     val touchMode: TouchMode = TouchMode.IDLE,
     val showKeyboard: Boolean = false,
+    // User preference: show the keyboard on the phone (IME fallback policy) instead of
+    // on the glasses. dexKeyboardActive reflects whether the policy actually took effect
+    // (false when `wm set-display-ime-policy` is unsupported on this build).
+    val dexKeyboardEnabled: Boolean = true,
+    val dexKeyboardActive: Boolean = false,
 ) {
     val externalDisplayConnected get() = targetDisplay != null
     val displayWidth get() = targetDisplay?.width ?: 1920
@@ -55,7 +65,14 @@ data class TouchpadState(
 
 class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val _state = MutableStateFlow(TouchpadState())
+    private val prefs = app.getSharedPreferences("touchpad_prefs", Context.MODE_PRIVATE)
+
+    private val _state = MutableStateFlow(TouchpadState(
+        sensitivity = prefs.getFloat("sensitivity", 0.5f),
+        scrollSpeed = prefs.getFloat("scroll_speed", 0.8f),
+        naturalScroll = prefs.getBoolean("natural_scroll", false),
+        dexKeyboardEnabled = prefs.getBoolean("dex_keyboard", true),
+    ))
     val state: StateFlow<TouchpadState> = _state.asStateFlow()
 
     private val displayManager = app.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
@@ -77,7 +94,10 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
         refresh()
         mouse.bind()
         TouchpadAccessibilityService.onExternalTextFocus = {
-            if (!_state.value.showKeyboard) {
+            // With the fallback IME policy active, Android shows the phone-side keyboard on
+            // its own and keystrokes flow directly to the field on the glasses — nothing to do
+            // (a BACK press here would dismiss that keyboard).
+            if (!_state.value.dexKeyboardActive && !_state.value.showKeyboard) {
                 _state.update { it.copy(showKeyboard = true) }
                 // Dismiss the glasses-side IME that Android auto-showed.
                 // BACK is consumed by the IME (dismisses it) and never reaches the app,
@@ -117,6 +137,7 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
 
         if (external != null && mouse.isConnected) {
             mouse.setDisplay(external.id, external.width, external.height)
+            applyImePolicy(external.id)
         }
 
         _state.update {
@@ -135,6 +156,24 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
 
     // Opens the Shizuku permission dialog so the user can grant shell-uid access.
     fun requestShizukuPermission() = mouse.requestPermission()
+
+    // Tracks the (displayId, policy) last applied successfully, so refresh() calls
+    // (which fire on every display event) don't re-exec the wm command needlessly.
+    private var appliedImePolicy: Pair<Int, Int>? = null
+
+    // Applies the IME policy matching the dexKeyboardEnabled preference to the external
+    // display: fallback → keyboard appears on the phone, local → on the glasses.
+    // Runs on IO because MouseService execs a `wm` subprocess. dexKeyboardActive is set
+    // only when the fallback policy actually took effect on this build.
+    private fun applyImePolicy(displayId: Int) {
+        val policy = if (_state.value.dexKeyboardEnabled) IME_POLICY_FALLBACK else IME_POLICY_LOCAL
+        if (appliedImePolicy == displayId to policy) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = mouse.setImePolicy(displayId, policy)
+            appliedImePolicy = if (ok) displayId to policy else null
+            _state.update { it.copy(dexKeyboardActive = ok && policy == IME_POLICY_FALLBACK) }
+        }
+    }
 
     // Input: raw pixel deltas from the touch event.
     // Applies velocity-adaptive exponential smoothing (heavy for slow/fine moves,
@@ -230,10 +269,25 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
     fun performGlobalAction(action: Int) =
         TouchpadAccessibilityService.instance?.performGlobalAction(action)
 
-    // Settings state updaters — each writes one field into TouchpadState.
-    fun setSensitivity(v: Float) = _state.update { it.copy(sensitivity = v) }
-    fun setScrollSpeed(v: Float) = _state.update { it.copy(scrollSpeed = v) }
-    fun setNaturalScroll(v: Boolean) = _state.update { it.copy(naturalScroll = v) }
+    // Settings state updaters — each writes one field into TouchpadState and persists it
+    // so tuned values survive app restarts.
+    fun setSensitivity(v: Float) {
+        prefs.edit().putFloat("sensitivity", v).apply()
+        _state.update { it.copy(sensitivity = v) }
+    }
+    fun setScrollSpeed(v: Float) {
+        prefs.edit().putFloat("scroll_speed", v).apply()
+        _state.update { it.copy(scrollSpeed = v) }
+    }
+    fun setNaturalScroll(v: Boolean) {
+        prefs.edit().putBoolean("natural_scroll", v).apply()
+        _state.update { it.copy(naturalScroll = v) }
+    }
+    fun setDexKeyboard(v: Boolean) {
+        prefs.edit().putBoolean("dex_keyboard", v).apply()
+        _state.update { it.copy(dexKeyboardEnabled = v) }
+        _state.value.targetDisplay?.let { applyImePolicy(it.id) }
+    }
     fun toggleSettings() = _state.update { it.copy(showSettings = !it.showSettings) }
 
     // Cleans up the accessibility callback, display listener, and mouse service when the
@@ -241,6 +295,11 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         TouchpadAccessibilityService.onExternalTextFocus = null
         displayManager.unregisterDisplayListener(displayListener)
+        // Restore the glasses-side IME before the service goes away. Synchronous call:
+        // viewModelScope is already cancelled by the time onCleared runs.
+        if (appliedImePolicy?.second == IME_POLICY_FALLBACK) {
+            _state.value.targetDisplay?.let { mouse.setImePolicy(it.id, IME_POLICY_LOCAL) }
+        }
         mouse.destroy()
     }
 }

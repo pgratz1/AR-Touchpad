@@ -104,11 +104,14 @@ fun TouchpadScreen(viewModel: TouchpadViewModel) {
                 sensitivity = state.sensitivity,
                 scrollSpeed = state.scrollSpeed,
                 naturalScroll = state.naturalScroll,
+                dexKeyboard = state.dexKeyboardEnabled,
+                dexKeyboardActive = state.dexKeyboardActive,
                 allDisplays = state.allDisplays,
                 targetDisplay = state.targetDisplay,
                 onSensitivity = viewModel::setSensitivity,
                 onScrollSpeed = viewModel::setScrollSpeed,
                 onNaturalScroll = viewModel::setNaturalScroll,
+                onDexKeyboard = viewModel::setDexKeyboard,
                 onDismiss = viewModel::toggleSettings,
             )
         } else {
@@ -539,11 +542,14 @@ private fun SettingsPanel(
     sensitivity: Float,
     scrollSpeed: Float,
     naturalScroll: Boolean,
+    dexKeyboard: Boolean,
+    dexKeyboardActive: Boolean,
     allDisplays: List<DisplayInfo>,
     targetDisplay: DisplayInfo?,
     onSensitivity: (Float) -> Unit,
     onScrollSpeed: (Float) -> Unit,
     onNaturalScroll: (Boolean) -> Unit,
+    onDexKeyboard: (Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
     Column(
@@ -578,6 +584,37 @@ private fun SettingsPanel(
             Switch(
                 checked = naturalScroll,
                 onCheckedChange = onNaturalScroll,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = ACCENT,
+                    checkedTrackColor = ACCENT_DIM,
+                    uncheckedThumbColor = TEXT_DIM,
+                    uncheckedTrackColor = Color(0xFF263545),
+                ),
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column {
+                Text("Keyboard on Phone", color = TEXT_DIM, fontSize = 14.sp)
+                Text(
+                    when {
+                        dexKeyboard && dexKeyboardActive ->
+                            "Glasses text fields open the phone keyboard (DeX style)"
+                        dexKeyboard && targetDisplay != null ->
+                            "Not supported on this device — using proxy keyboard"
+                        else ->
+                            "Off: keyboard opens on the glasses; use ⌨ for the proxy"
+                    },
+                    color = TEXT_MUTED, fontSize = 11.sp,
+                )
+            }
+            Switch(
+                checked = dexKeyboard,
+                onCheckedChange = onDexKeyboard,
                 colors = SwitchDefaults.colors(
                     checkedThumbColor = ACCENT,
                     checkedTrackColor = ACCENT_DIM,

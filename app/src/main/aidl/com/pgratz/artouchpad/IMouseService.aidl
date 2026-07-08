@@ -28,7 +28,7 @@ interface IMouseService {
     void click(float x, float y, int button) = 3;
 
     // Scrolls the content under the cursor by (dx, dy) finger-pixel deltas.
-    // dy is converted to wheel detents; dx is reserved for horizontal scroll.
+    // dy is converted to REL_WHEEL detents, dx to REL_HWHEEL detents.
     void scroll(float dx, float dy) = 4;
 
     // Injects a key press+release for the given Android keycode (e.g. KEYCODE_BACK = 4)
@@ -56,6 +56,13 @@ interface IMouseService {
     // WebView-based apps zoom their content without changing the system font scale.
     // amount: AXIS_VSCROLL value (positive = zoom in, negative = zoom out).
     void ctrlScroll(float amount) = 11;
+
+    // Sets the per-display IME policy via IWindowManager.setDisplayImePolicy (reflection;
+    // shell uid holds the required INTERNAL_SYSTEM_WINDOW permission).
+    // policy: 0 = local (IME on the display that owns the field), 1 = fallback (IME on the
+    // default display, i.e. the phone — DeX-style), 2 = hide.
+    // Returns true if the call succeeded; false if unsupported on this build.
+    boolean setImePolicy(int displayId, int policy) = 12;
 
     // Closes the uinput file descriptor and marks the device not ready.
     void destroy() = 16777114;
