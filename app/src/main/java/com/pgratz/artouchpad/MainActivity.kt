@@ -15,10 +15,14 @@
 package com.pgratz.artouchpad
 
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import com.pgratz.artouchpad.ui.TouchpadScreen
 import com.pgratz.artouchpad.ui.theme.ARTouchpadTheme
 
@@ -28,11 +32,28 @@ class MainActivity : ComponentActivity() {
     private val viewModel: TouchpadViewModel by viewModels()
 
     // Sets up edge-to-edge display and mounts the full-screen TouchpadScreen composable.
+    // The Activity window is marked FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL by default
+    // so that touches on the touchpad surface do NOT cause Android desktop mode to switch
+    // the "focused display" from the glasses display back to the phone (which would dim
+    // the glasses-side window's status bar as if it had lost focus). The flags are cleared
+    // dynamically whenever the in-app KeyboardProxy needs the EditText to receive focus.
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+        )
         enableEdgeToEdge()
         setContent {
             ARTouchpadTheme {
+                val state by viewModel.state.collectAsState()
+                LaunchedEffect(state.showKeyboard) {
+                    val notFocusable =
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    if (state.showKeyboard) window.clearFlags(notFocusable)
+                    else window.addFlags(notFocusable)
+                }
                 TouchpadScreen(viewModel = viewModel)
             }
         }
