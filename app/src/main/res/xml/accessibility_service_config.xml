@@ -9,18 +9,23 @@
     flagReportViewIds            — lets us read source.window.displayId to identify the glasses.
     flagRetrieveInteractiveWindows — required to see windows on non-default (glasses) displays.
 
-  canPerformGestures="true"
-      Required to dispatch tap/swipe gestures via dispatchGesture().
-
   canRetrieveWindowContent="true"
       Required to read source.window and source.isEditable from accessibility events.
+
+  canPerformGestures is deliberately NOT set. Setting it makes AccessibilityManagerService
+  install AccessibilityInputFilter with motion-event injection, which demultiplexes input
+  per source: the moment our uinput mouse emits a REL event mid-drag, the filter tears down
+  the in-flight touchscreen stream and the app receives ACTION_CANCEL. The finger gesture
+  then dies ~100 ms in, so the cursor twitches once and freezes for the rest of the drag.
+  Nothing here needs the capability — the nav bar uses performGlobalAction(), which is
+  always available; only dispatchGesture() requires it, and the dispatchGesture-based
+  helpers in TouchpadAccessibilityService have no callers.
 -->
 <accessibility-service
     xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeAllMask"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows"
-    android:canPerformGestures="true"
     android:canRetrieveWindowContent="true"
     android:description="@string/accessibility_service_description"
     android:notificationTimeout="100"

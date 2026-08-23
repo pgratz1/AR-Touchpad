@@ -80,11 +80,34 @@ class MouseService : IMouseService.Stub() {
             imgClass?.getMethod("getInputDevice", Int::class.javaPrimitiveType)
         }.getOrNull()
     }
+    // Current AOSP association API (replaced setInputDeviceDisplayAssociation at some point
+    // before Android 17): keyed by the display's uniqueId string rather than its integer id.
+    private val imgAddUniqueIdAssoc by lazy {
+        runCatching {
+            imgClass?.getMethod("addUniqueIdAssociationByDescriptor",
+                String::class.java, String::class.java)
+        }.getOrNull()
+    }
+    // Legacy association API, kept as a fallback for pre-Android-15 builds where the
+    // uniqueId-based method above doesn't exist yet.
     private val imgSetDisplayAssoc by lazy {
         runCatching {
             imgClass?.getMethod("setInputDeviceDisplayAssociation",
                 String::class.java, Int::class.javaPrimitiveType)
         }.getOrNull()
+    }
+
+    // Reflection handles for resolving a display's uniqueId string (e.g. "local:462...") from
+    // its integer id, via the same hidden-global pattern as InputManagerGlobal above. Needed
+    // because addUniqueIdAssociationByDescriptor takes a uniqueId, not an integer displayId.
+    private val dmgClass by lazy {
+        runCatching { Class.forName("android.hardware.display.DisplayManagerGlobal") }.getOrNull()
+    }
+    private val dmgInstance by lazy {
+        runCatching { dmgClass?.getMethod("getInstance")?.invoke(null) }.getOrNull()
+    }
+    private val dmgGetDisplayInfo by lazy {
+        runCatching { dmgClass?.getMethod("getDisplayInfo", Int::class.javaPrimitiveType) }.getOrNull()
     }
 
     // Reflection handles for IWindowManager.setDisplayImePolicy — controls which display
@@ -165,25 +188,60 @@ class MouseService : IMouseService.Stub() {
         }.firstOrNull()
     }.getOrNull()
 
+    // Resolves the uniqueId string DisplayManagerGlobal uses to identify a display
+    // (e.g. "local:4619827259835644672"), required by addUniqueIdAssociationByDescriptor.
+    private fun getDisplayUniqueId(targetDisplayId: Int): String? = runCatching {
+        val instance = dmgInstance ?: return@runCatching null
+        val getInfo = dmgGetDisplayInfo ?: return@runCatching null
+        val info = getInfo.invoke(instance, targetDisplayId) ?: return@runCatching null
+        info.javaClass.getField("uniqueId").get(info) as? String
+    }.getOrNull()
+
     // Tells Android's InputReader to route this uinput device's cursor to targetDisplayId.
-    // Falls back to accessing the raw IInputManager binder via the mIm field if
-    // setInputDeviceDisplayAssociation is not exposed directly on InputManagerGlobal.
+    // Tries, in order: the current AOSP API (addUniqueIdAssociationByDescriptor, keyed by the
+    // display's uniqueId string), the same method via the raw IInputManager binder (mIm field)
+    // if not exposed directly on InputManagerGlobal, and finally the legacy integer-displayId
+    // method (setInputDeviceDisplayAssociation) for any pre-Android-15 device still running
+    // this app. The uniqueId-based API replaced the legacy one at some point before Android 17
+    // — on builds where only the legacy name resolved, association silently no-opped and the
+    // uinput device was never actually pinned to the external display, so REL_X/REL_Y motion
+    // moved a cursor on the wrong (invisible) display while BTN_LEFT clicks, which are
+    // dispatched to the focused window rather than a device-associated display, still worked.
     private fun associateDeviceToDisplay(descriptor: String, targetDisplayId: Int) {
         runCatching {
             val instance = imgInstance ?: return
-            val method = imgSetDisplayAssoc ?: run {
-                // Fallback: call through the raw IInputManager binder held by InputManagerGlobal.
-                val mImField = imgClass?.getDeclaredField("mIm")
-                    ?.also { it.isAccessible = true }
-                val iim = mImField?.get(instance) ?: return
-                val iimMethod = iim.javaClass.getMethod("setInputDeviceDisplayAssociation",
-                    String::class.java, Int::class.javaPrimitiveType)
-                iimMethod.invoke(iim, descriptor, targetDisplayId)
-                Log.i(TAG, "associated uinput device (via mIm) to display $targetDisplayId")
+            val uniqueId = getDisplayUniqueId(targetDisplayId)
+
+            if (uniqueId != null) {
+                val direct = imgAddUniqueIdAssoc
+                if (direct != null) {
+                    direct.invoke(instance, descriptor, uniqueId)
+                    Log.i(TAG, "associated uinput device to display $targetDisplayId ($uniqueId)")
+                    return
+                }
+                val mImField = imgClass?.getDeclaredField("mIm")?.also { it.isAccessible = true }
+                val iim = mImField?.get(instance)
+                val viaBinder = iim?.javaClass?.let {
+                    runCatching {
+                        it.getMethod("addUniqueIdAssociationByDescriptor",
+                            String::class.java, String::class.java)
+                    }.getOrNull()
+                }
+                if (iim != null && viaBinder != null) {
+                    viaBinder.invoke(iim, descriptor, uniqueId)
+                    Log.i(TAG, "associated uinput device (via mIm) to display $targetDisplayId ($uniqueId)")
+                    return
+                }
+            }
+
+            val legacy = imgSetDisplayAssoc
+            if (legacy != null) {
+                legacy.invoke(instance, descriptor, targetDisplayId)
+                Log.i(TAG, "associated uinput device to display $targetDisplayId (legacy API)")
                 return
             }
-            method.invoke(instance, descriptor, targetDisplayId)
-            Log.i(TAG, "associated uinput device to display $targetDisplayId")
+
+            Log.w(TAG, "no display-association API available (uniqueId=$uniqueId)")
         }.onFailure { Log.w(TAG, "associateDeviceToDisplay failed: $it") }
     }
 
@@ -237,6 +295,7 @@ class MouseService : IMouseService.Stub() {
         ev(EV_REL, REL_X, idx)
         ev(EV_REL, REL_Y, idy)
         sync()
+        Log.v(TAG, "moveMouse rel=($idx,$idy) displayId=$displayId")
     }
 
     // Presses (value=1) then releases (value=0) BTN_LEFT or BTN_RIGHT with a 50 ms hold.
@@ -247,6 +306,7 @@ class MouseService : IMouseService.Stub() {
         ev(EV_KEY, btn, 1); sync()
         Thread.sleep(50)
         ev(EV_KEY, btn, 0); sync()
+        Log.d(TAG, "click btn=0x${btn.toString(16)} displayId=$displayId")
     }
 
     // Input: Android keycode (e.g. KeyEvent.KEYCODE_BACK = 4).

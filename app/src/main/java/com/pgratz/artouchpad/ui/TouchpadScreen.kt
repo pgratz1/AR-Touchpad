@@ -261,6 +261,7 @@ private fun TouchpadSurface(
                     if (!enabled) return@pointerInput
 
                     var lastPositions = mapOf<PointerId, Offset>()
+                    var downPosition = Offset.Zero
                     var downTime = 0L
                     var didMove = false
                     var lastTapTime = 0L
@@ -287,6 +288,7 @@ private fun TouchpadSurface(
                                     isSelectMode = false
                                     downTime = now
                                     didMove = false
+                                    downPosition = pressed.first().position
                                     lastPositions = pressed.associate { it.id to it.position }
                                     // Timer fires after LONG_PRESS_MS if finger hasn't moved;
                                     // haptic confirms entry; subsequent drag transitions into select mode.
@@ -304,7 +306,14 @@ private fun TouchpadSurface(
                                         if (last != null) {
                                             val dx = p.position.x - last.x
                                             val dy = p.position.y - last.y
-                                            val moved = abs(dx) > MOVE_THRESHOLD || abs(dy) > MOVE_THRESHOLD
+                                            // Latch the drag on cumulative displacement from the touch-down
+                                            // point, never on the per-event delta: at 120 Hz a deliberate slow
+                                            // drag delivers barely 1 px per event, so a per-event test never
+                                            // crosses the threshold and the cursor stays frozen no matter how
+                                            // far the finger actually travels.
+                                            val totalDx = p.position.x - downPosition.x
+                                            val totalDy = p.position.y - downPosition.y
+                                            val moved = abs(totalDx) > MOVE_THRESHOLD || abs(totalDy) > MOVE_THRESHOLD
 
                                             // After long press fired: first movement enters select mode
                                             // (BTN_LEFT pressed; subsequent moves extend text selection).
