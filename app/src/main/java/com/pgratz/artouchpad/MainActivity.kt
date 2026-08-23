@@ -24,17 +24,36 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.pgratz.artouchpad.ui.TouchpadScreen
 import com.pgratz.artouchpad.ui.theme.ARTouchpadTheme
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 
-// Idle period after which the phone screen is dimmed to save power. The screen is never
-// allowed to sleep while this activity is on top (FLAG_KEEP_SCREEN_ON) — the user is
-// looking through the glasses, and a sleeping phone means a dead touchpad.
-private const val IDLE_DIM_MS = 30_000L
+// The touchpad UI is covered by a black scrim after TouchpadState.dimDelaySec of no input
+// (user-configurable in the settings panel; 0 disables it). The screen is never allowed to
+// sleep while this activity is on top (FLAG_KEEP_SCREEN_ON) — the user is looking through
+// the glasses, and a sleeping phone means a dead touchpad.
+//
+// The scrim is deliberately in-app rather than a WindowManager.LayoutParams.screenBrightness
+// override: that override is handed to PowerManagerService and applied to every display
+// power group, so on a phone driving XR glasses it dims (and can blank) the glasses too.
 
-// Window brightness override applied when idle. Low enough to save meaningful power on
-// OLED, high enough that the surface is still visible if the user glances at the phone.
-private const val DIM_BRIGHTNESS = 0.05f
+// Opacity of the black scrim drawn over the touchpad when idle. High enough to blank the
+// OLED almost completely (which is where the power saving comes from), low enough that the
+// UI is still readable if the user glances down at the phone.
+private const val DIM_ALPHA = 0.92f
 
 // Single-activity entry point. Hosts the Compose UI and owns the ViewModel lifecycle.
 class MainActivity : ComponentActivity() {
@@ -42,22 +61,25 @@ class MainActivity : ComponentActivity() {
     private val viewModel: TouchpadViewModel by viewModels()
 
     private val idleHandler = Handler(Looper.getMainLooper())
-    private var isDimmed = false
+    private var isDimmed by mutableStateOf(false)
     private var pointerDown = false
 
-    // Dimming rewrites the window attributes, which forces a relayout — and a relayout
-    // mid-gesture can reset Compose's pointerInput and cancel the drag. A finger resting
-    // motionless emits no ACTION_MOVE, so defer while any pointer is still down.
+    // A finger resting motionless emits no ACTION_MOVE, so a long press or a paused drag
+    // looks identical to idleness. Defer while any pointer is still down rather than
+    // dimming out from under an in-flight gesture.
     private val dimRunnable = object : Runnable {
         override fun run() {
             if (pointerDown) {
-                idleHandler.postDelayed(this, IDLE_DIM_MS)
+                scheduleDim()
                 return
             }
-            applyBrightness(DIM_BRIGHTNESS)
             isDimmed = true
         }
     }
+
+    // Idle timeout from the live setting, in ms; 0 (the "Never" chip) disables dimming.
+    private val dimDelayMs: Long
+        get() = viewModel.state.value.dimDelaySec.toLong() * 1000L
 
     // Sets up edge-to-edge display and mounts the full-screen TouchpadScreen composable.
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,9 +88,30 @@ class MainActivity : ComponentActivity() {
         // Applies only while this window is in front, so the phone resumes its normal
         // timeout as soon as the touchpad is backgrounded.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Changing the delay in settings restarts the countdown against the new value, so
+        // picking "Never" clears a pending dim and picking a shorter delay takes effect now.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.state.map { it.dimDelaySec }.distinctUntilChanged().collect {
+                    noteInteraction()
+                }
+            }
+        }
         setContent {
             ARTouchpadTheme {
-                TouchpadScreen(viewModel = viewModel)
+                Box(modifier = Modifier.fillMaxSize()) {
+                    TouchpadScreen(viewModel = viewModel)
+                    if (isDimmed) {
+                        // Draw-only overlay: no pointerInput modifier, so touches fall
+                        // straight through to the touchpad surface underneath and the
+                        // gesture that wakes the screen still counts as a gesture.
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(Color.Black.copy(alpha = DIM_ALPHA)),
+                        )
+                    }
+                }
             }
         }
     }
@@ -90,20 +133,18 @@ class MainActivity : ComponentActivity() {
         return super.dispatchKeyEvent(event)
     }
 
-    // Restores full brightness if dimmed and restarts the idle countdown. Runs on every
-    // touch event (~120 Hz during a drag), so it stays cheap: the window is only touched
-    // on an actual dim→bright transition, otherwise this is just a handler re-post.
+    // Clears the scrim if present and restarts the idle countdown. Runs on every touch
+    // event (~120 Hz during a drag), so it stays cheap: state is only written on an actual
+    // dim→bright transition, otherwise this is just a handler re-post.
     private fun noteInteraction() {
-        if (isDimmed) {
-            applyBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE)
-            isDimmed = false
-        }
-        idleHandler.removeCallbacks(dimRunnable)
-        idleHandler.postDelayed(dimRunnable, IDLE_DIM_MS)
+        isDimmed = false
+        scheduleDim()
     }
 
-    private fun applyBrightness(value: Float) {
-        window.attributes = window.attributes.also { it.screenBrightness = value }
+    private fun scheduleDim() {
+        idleHandler.removeCallbacks(dimRunnable)
+        val delay = dimDelayMs
+        if (delay > 0) idleHandler.postDelayed(dimRunnable, delay)
     }
 
     // Re-checks display and Shizuku state when returning from Settings or the permission
@@ -114,12 +155,11 @@ class MainActivity : ComponentActivity() {
         noteInteraction()
     }
 
-    // Drops the brightness override and the pending dim so a backgrounded touchpad never
-    // holds the screen dark for whatever the user switched to.
+    // Drops the scrim and the pending dim so the touchpad never comes back to the
+    // foreground already dark.
     override fun onPause() {
         super.onPause()
         idleHandler.removeCallbacks(dimRunnable)
-        applyBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE)
         isDimmed = false
         pointerDown = false
     }

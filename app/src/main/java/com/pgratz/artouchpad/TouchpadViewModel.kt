@@ -35,10 +35,13 @@ enum class TouchMode { IDLE, CURSOR, SCROLL, SELECT }
 private const val IME_POLICY_LOCAL = 0     // IME on the display that owns the focused field
 private const val IME_POLICY_FALLBACK = 1  // IME on the default display (phone) — DeX-style
 
+// Idle-dim choices offered in the settings panel, in seconds; 0 means "never dim".
+val DIM_DELAY_CHOICES_SEC = listOf(0, 15, 30, 60, 120, 300)
+const val DEFAULT_DIM_DELAY_SEC = 30
+
 data class DisplayInfo(val id: Int, val name: String, val width: Int, val height: Int)
 
 data class TouchpadState(
-    val isServiceEnabled: Boolean = false,
     val shizukuAvailable: Boolean = false,
     val shizukuPermission: Boolean = false,
     val mouseReady: Boolean = false,
@@ -51,7 +54,8 @@ data class TouchpadState(
     val naturalScroll: Boolean = false,
     val showSettings: Boolean = false,
     val touchMode: TouchMode = TouchMode.IDLE,
-    val showKeyboard: Boolean = false,
+    // Seconds of no input before MainActivity scrims the touchpad UI. 0 = never dim.
+    val dimDelaySec: Int = DEFAULT_DIM_DELAY_SEC,
     // User preference: show the keyboard on the phone (IME fallback policy) instead of
     // on the glasses. dexKeyboardActive reflects whether the policy actually took effect
     // (false when `wm set-display-ime-policy` is unsupported on this build).
@@ -71,6 +75,7 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
         sensitivity = prefs.getFloat("sensitivity", 0.5f),
         scrollSpeed = prefs.getFloat("scroll_speed", 0.8f),
         naturalScroll = prefs.getBoolean("natural_scroll", false),
+        dimDelaySec = prefs.getInt("dim_delay_sec", DEFAULT_DIM_DELAY_SEC),
         dexKeyboardEnabled = prefs.getBoolean("dex_keyboard", true),
     ))
     val state: StateFlow<TouchpadState> = _state.asStateFlow()
@@ -93,21 +98,6 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
         displayManager.registerDisplayListener(displayListener, null)
         refresh()
         mouse.bind()
-        TouchpadAccessibilityService.onExternalTextFocus = {
-            // With the fallback IME policy active, Android shows the phone-side keyboard on
-            // its own and keystrokes flow directly to the field on the glasses — nothing to do
-            // (a BACK press here would dismiss that keyboard).
-            if (!_state.value.dexKeyboardActive && !_state.value.showKeyboard) {
-                _state.update { it.copy(showKeyboard = true) }
-                // Dismiss the glasses-side IME that Android auto-showed.
-                // BACK is consumed by the IME (dismisses it) and never reaches the app,
-                // so Chrome's text field stays focused and ready for our injected text.
-                viewModelScope.launch {
-                    delay(400)
-                    mouse.pressKey(android.view.KeyEvent.KEYCODE_BACK)
-                }
-            }
-        }
     }
 
     // Enumerates all displays via DisplayManager; picks the first non-default display as the
@@ -142,7 +132,6 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
 
         _state.update {
             it.copy(
-                isServiceEnabled = TouchpadAccessibilityService.instance != null,
                 shizukuAvailable = mouse.hasShizuku(),
                 shizukuPermission = mouse.hasPermission(),
                 mouseReady = mouse.hasPermission() && mouse.isConnected,
@@ -249,25 +238,6 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
             mouse.ctrlScroll(detents.toFloat())
         }
     }
-    // Toggles showKeyboard in state, which shows or hides the KeyboardProxy strip in the UI.
-    fun toggleKeyboard() = _state.update { it.copy(showKeyboard = !it.showKeyboard) }
-
-    // Input: text accumulated in the phone keyboard proxy.
-    // Dismisses the phone keyboard first (to avoid IME session conflicts), waits 200 ms for
-    // the IME to tear down, then injects the text followed by Enter to the glasses display.
-    fun sendKeyboardText(text: String) {
-        if (text.isEmpty()) { toggleKeyboard(); return }
-        toggleKeyboard()
-        viewModelScope.launch {
-            delay(200)
-            mouse.typeText(text)
-            mouse.pressKey(android.view.KeyEvent.KEYCODE_ENTER)
-        }
-    }
-
-    // Delegates an AccessibilityService global action (e.g. GLOBAL_ACTION_BACK) to the service instance.
-    fun performGlobalAction(action: Int) =
-        TouchpadAccessibilityService.instance?.performGlobalAction(action)
 
     // Settings state updaters — each writes one field into TouchpadState and persists it
     // so tuned values survive app restarts.
@@ -283,6 +253,12 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
         prefs.edit().putBoolean("natural_scroll", v).apply()
         _state.update { it.copy(naturalScroll = v) }
     }
+    // Seconds of idle time before the touchpad UI is scrimmed; 0 disables dimming entirely.
+    // MainActivity observes this and restarts its idle timer when it changes.
+    fun setDimDelay(sec: Int) {
+        prefs.edit().putInt("dim_delay_sec", sec).apply()
+        _state.update { it.copy(dimDelaySec = sec) }
+    }
     fun setDexKeyboard(v: Boolean) {
         prefs.edit().putBoolean("dex_keyboard", v).apply()
         _state.update { it.copy(dexKeyboardEnabled = v) }
@@ -290,10 +266,9 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun toggleSettings() = _state.update { it.copy(showSettings = !it.showSettings) }
 
-    // Cleans up the accessibility callback, display listener, and mouse service when the
+    // Cleans up the display listener and mouse service when the
     // ViewModel is destroyed (e.g. app process ends or activity is permanently finished).
     override fun onCleared() {
-        TouchpadAccessibilityService.onExternalTextFocus = null
         displayManager.unregisterDisplayListener(displayListener)
         // Restore the glasses-side IME before the service goes away. Synchronous call:
         // viewModelScope is already cancelled by the time onCleared runs.

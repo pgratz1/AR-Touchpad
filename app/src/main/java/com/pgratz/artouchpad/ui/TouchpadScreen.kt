@@ -14,14 +14,12 @@
 
 package com.pgratz.artouchpad.ui
 
-import android.content.Intent
-import android.provider.Settings
 import android.view.KeyEvent as AKeyEvent
-import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.InputMethodManager
-import android.widget.EditText
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -35,12 +33,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.*
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
+import com.pgratz.artouchpad.DIM_DELAY_CHOICES_SEC
 import com.pgratz.artouchpad.DisplayInfo
 import com.pgratz.artouchpad.TouchMode
 import com.pgratz.artouchpad.TouchpadViewModel
@@ -68,12 +65,10 @@ private const val LONG_PRESS_MS = 600L
 private const val DOUBLE_TAP_WINDOW_MS = 300L
 
 // Root composable. Collects ViewModel state and renders either SettingsPanel (when
-// showSettings is true) or the main layout: StatusBar → TouchpadSurface → optional
-// KeyboardProxy → NavigationBar.
+// showSettings is true) or the main layout: StatusBar → TouchpadSurface → NavigationBar.
 @Composable
 fun TouchpadScreen(viewModel: TouchpadViewModel) {
     val state by viewModel.state.collectAsState()
-    val context = LocalContext.current
 
     Column(
         modifier = Modifier
@@ -85,18 +80,11 @@ fun TouchpadScreen(viewModel: TouchpadViewModel) {
             shizukuAvailable = state.shizukuAvailable,
             shizukuPermission = state.shizukuPermission,
             mouseReady = state.mouseReady,
-            serviceEnabled = state.isServiceEnabled,
             targetDisplay = state.targetDisplay,
             touchMode = state.touchMode,
             onSettingsClick = viewModel::toggleSettings,
             onGrantShizuku = viewModel::requestShizukuPermission,
             onConnectMouse = { viewModel.mouse.bind() },
-            onEnableService = {
-                context.startActivity(
-                    android.content.Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            },
         )
 
         if (state.showSettings) {
@@ -104,6 +92,7 @@ fun TouchpadScreen(viewModel: TouchpadViewModel) {
                 sensitivity = state.sensitivity,
                 scrollSpeed = state.scrollSpeed,
                 naturalScroll = state.naturalScroll,
+                dimDelaySec = state.dimDelaySec,
                 dexKeyboard = state.dexKeyboardEnabled,
                 dexKeyboardActive = state.dexKeyboardActive,
                 allDisplays = state.allDisplays,
@@ -111,6 +100,7 @@ fun TouchpadScreen(viewModel: TouchpadViewModel) {
                 onSensitivity = viewModel::setSensitivity,
                 onScrollSpeed = viewModel::setScrollSpeed,
                 onNaturalScroll = viewModel::setNaturalScroll,
+                onDimDelay = viewModel::setDimDelay,
                 onDexKeyboard = viewModel::setDexKeyboard,
                 onDismiss = viewModel::toggleSettings,
             )
@@ -128,38 +118,28 @@ fun TouchpadScreen(viewModel: TouchpadViewModel) {
                 onSelectStart = viewModel::startSelectDrag,
                 onSelectEnd = viewModel::endSelectDrag,
             )
-            if (state.showKeyboard) {
-                KeyboardProxy(
-                    onSend    = { text -> viewModel.sendKeyboardText(text) },
-                    onDismiss = viewModel::toggleKeyboard,
-                )
-            }
             NavigationBar(
-                keyboardActive = state.showKeyboard,
-                onBack         = { viewModel.pressKey(AKeyEvent.KEYCODE_BACK) },
-                onHome         = { viewModel.pressKey(AKeyEvent.KEYCODE_HOME) },
-                onRecents      = { viewModel.pressKey(AKeyEvent.KEYCODE_APP_SWITCH) },
-                onToggleKeyboard = viewModel::toggleKeyboard,
+                onBack    = { viewModel.pressKey(AKeyEvent.KEYCODE_BACK) },
+                onHome    = { viewModel.pressKey(AKeyEvent.KEYCODE_HOME) },
+                onRecents = { viewModel.pressKey(AKeyEvent.KEYCODE_APP_SWITCH) },
             )
         }
     }
 }
 
-// Top status bar showing the app title, three status dots (Mouse/Display/Nav),
+// Top status bar showing the app title, two status dots (Mouse/Display),
 // the current touch mode indicator, and contextual action buttons for each
-// unmet setup step (grant Shizuku → connect mouse → enable accessibility service).
+// unmet setup step (grant Shizuku → connect mouse).
 @Composable
 private fun StatusBar(
     shizukuAvailable: Boolean,
     shizukuPermission: Boolean,
     mouseReady: Boolean,
-    serviceEnabled: Boolean,
     targetDisplay: DisplayInfo?,
     touchMode: TouchMode,
     onSettingsClick: () -> Unit,
     onGrantShizuku: () -> Unit,
     onConnectMouse: () -> Unit,
-    onEnableService: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
@@ -174,7 +154,6 @@ private fun StatusBar(
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     StatusDot(mouseReady, "Mouse")
                     StatusDot(targetDisplay != null, "Display")
-                    StatusDot(serviceEnabled, "Nav")
                     val modeLabel = when (touchMode) {
                         TouchMode.SCROLL -> "↕ scroll"
                         TouchMode.SELECT -> "⊹ select"
@@ -196,10 +175,6 @@ private fun StatusBar(
                         TextButton(onClick = onConnectMouse, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)) {
                             Text("Connect", color = Color(0xFFFFB300), fontSize = 12.sp)
                         }
-                    !serviceEnabled ->
-                        TextButton(onClick = onEnableService, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)) {
-                            Text("Enable Nav", color = Color(0xFFFFB300), fontSize = 12.sp)
-                        }
                 }
                 IconButton(onClick = onSettingsClick) {
                     Text("⚙", color = TEXT_DIM, fontSize = 22.sp)
@@ -212,7 +187,7 @@ private fun StatusBar(
 }
 
 // Small colored circle (green = active, gray = inactive) followed by a text label.
-// Used in StatusBar to show Mouse/Display/Nav readiness at a glance.
+// Used in StatusBar to show Mouse/Display readiness at a glance.
 @Composable
 private fun StatusDot(active: Boolean, label: String) {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -445,75 +420,14 @@ private fun TouchpadSurface(
     }
 }
 
-// A thin input strip containing an Android EditText that hosts the system keyboard (Gboard).
-// Text accumulates in the EditText; tapping ↵ or the send button calls onSend with the full
-// string so it can be injected to the glasses after the phone IME is dismissed.
-// Accumulates on the phone so Gboard swipe/autocorrect work normally without interfering
-// with the glasses display's IME session.
-@Composable
-private fun KeyboardProxy(
-    onSend: (String) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val editRef = remember { mutableStateOf<EditText?>(null) }
-
-    val doSend: () -> Unit = {
-        val text = editRef.value?.text?.toString() ?: ""
-        editRef.value?.setText("")
-        onSend(text)
-    }
-
-    HorizontalDivider(color = Color(0xFF1E2A38), thickness = 1.dp)
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(SURFACE)
-            .padding(horizontal = 12.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        AndroidView(
-            factory = { ctx ->
-                EditText(ctx).apply {
-                    hint = "Type here, then tap ↵"
-                    setHintTextColor(android.graphics.Color.parseColor("#546E7A"))
-                    setTextColor(android.graphics.Color.parseColor("#E0E0E0"))
-                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                    isFocusable = true
-                    isFocusableInTouchMode = true
-                    maxLines = 2
-                    imeOptions = EditorInfo.IME_ACTION_SEND or EditorInfo.IME_FLAG_NO_EXTRACT_UI
-                    setOnEditorActionListener { _, actionId, _ ->
-                        if (actionId == EditorInfo.IME_ACTION_SEND) { doSend(); true } else false
-                    }
-                }
-            },
-            update = { view ->
-                editRef.value = view
-                view.requestFocus()
-                val imm = view.context.getSystemService(InputMethodManager::class.java)
-                imm?.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
-            },
-            modifier = Modifier.weight(1f),
-        )
-        IconButton(onClick = doSend, modifier = Modifier.size(40.dp)) {
-            Text("↵", color = ACCENT, fontSize = 20.sp)
-        }
-        IconButton(onClick = onDismiss, modifier = Modifier.size(36.dp)) {
-            Text("✕", color = TEXT_DIM, fontSize = 18.sp)
-        }
-    }
-}
-
-// Bottom navigation row with four buttons: Back, Home, Apps (Recents), and keyboard toggle.
-// The keyboard button is tinted accent when the proxy is active.
+// Bottom navigation row: Back, Home, Apps (Recents). Each injects the matching key event
+// on the glasses display. Text input needs no button here — with the IME fallback policy a
+// field focused on the glasses opens Gboard on the phone by itself.
 @Composable
 private fun NavigationBar(
-    keyboardActive: Boolean,
     onBack: () -> Unit,
     onHome: () -> Unit,
     onRecents: () -> Unit,
-    onToggleKeyboard: () -> Unit,
 ) {
     HorizontalDivider(color = Color(0xFF1E2A38), thickness = 1.dp)
     Row(
@@ -526,8 +440,6 @@ private fun NavigationBar(
         NavButton("◀", "Back", onBack)
         NavButton("⬤", "Home", onHome)
         NavButton("▦", "Apps", onRecents)
-        NavButton("⌨", "Keys", onToggleKeyboard,
-            tint = if (keyboardActive) ACCENT else NAV_ICON)
     }
 }
 
@@ -544,13 +456,15 @@ private fun NavButton(icon: String, label: String, onClick: () -> Unit, tint: Co
 }
 
 // Full-screen settings overlay (shown instead of the touchpad when gear is tapped).
-// Contains cursor/scroll speed sliders, natural scroll toggle, connected display list,
-// and a gesture reference guide. Dismissed via the "Done" button.
+// Contains cursor/scroll speed sliders, natural scroll toggle, idle-dim delay, connected
+// display list, and a gesture reference guide. Scrolls, because the content is taller than
+// the phone screen. Dismissed via the "Done" button.
 @Composable
 private fun SettingsPanel(
     sensitivity: Float,
     scrollSpeed: Float,
     naturalScroll: Boolean,
+    dimDelaySec: Int,
     dexKeyboard: Boolean,
     dexKeyboardActive: Boolean,
     allDisplays: List<DisplayInfo>,
@@ -558,12 +472,14 @@ private fun SettingsPanel(
     onSensitivity: (Float) -> Unit,
     onScrollSpeed: (Float) -> Unit,
     onNaturalScroll: (Boolean) -> Unit,
+    onDimDelay: (Int) -> Unit,
     onDexKeyboard: (Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
@@ -602,6 +518,8 @@ private fun SettingsPanel(
             )
         }
 
+        DimDelaySetting(dimDelaySec, onDimDelay)
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -614,9 +532,9 @@ private fun SettingsPanel(
                         dexKeyboard && dexKeyboardActive ->
                             "Glasses text fields open the phone keyboard (DeX style)"
                         dexKeyboard && targetDisplay != null ->
-                            "Not supported on this device — using proxy keyboard"
+                            "Not supported on this device — keyboard opens on the glasses"
                         else ->
-                            "Off: keyboard opens on the glasses; use ⌨ for the proxy"
+                            "Off: keyboard opens on the glasses; type with the cursor"
                     },
                     color = TEXT_MUTED, fontSize = 11.sp,
                 )
@@ -655,8 +573,6 @@ private fun SettingsPanel(
             }
         }
 
-        Spacer(modifier = Modifier.weight(1f))
-
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("Gesture Guide", color = TEXT_MUTED, fontSize = 13.sp, fontWeight = FontWeight.Medium)
             GestureHint("1 finger drag", "Move cursor")
@@ -668,6 +584,50 @@ private fun SettingsPanel(
             GestureHint("2 finger pinch", "Zoom page")
         }
     }
+}
+
+// Idle-dim delay picker: one selectable chip per DIM_DELAY_CHOICES_SEC entry, with 0
+// rendered as "Never". The scrim is drawn by MainActivity over this app's own window only —
+// it never touches the brightness of the glasses (see MainActivity for why that matters).
+@Composable
+private fun DimDelaySetting(selectedSec: Int, onSelect: (Int) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Column {
+                Text("Dim Touchpad After", color = TEXT_DIM, fontSize = 14.sp)
+                Text("Blanks the phone screen when idle; glasses unaffected",
+                    color = TEXT_MUTED, fontSize = 11.sp)
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            DIM_DELAY_CHOICES_SEC.forEach { sec ->
+                val selected = sec == selectedSec
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (selected) ACCENT_DIM else SURFACE)
+                        .clickable { onSelect(sec) }
+                        .padding(vertical = 8.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        dimDelayLabel(sec),
+                        color = if (selected) ACCENT else TEXT_MUTED,
+                        fontSize = 12.sp,
+                        fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
+                    )
+                }
+            }
+        }
+    }
+}
+
+// 0 → "Never", under a minute → "30s", otherwise whole minutes → "2m".
+private fun dimDelayLabel(sec: Int): String = when {
+    sec <= 0 -> "Never"
+    sec < 60 -> "${sec}s"
+    else -> "${sec / 60}m"
 }
 
 // A labeled Slider with the formatted current value displayed to its right.

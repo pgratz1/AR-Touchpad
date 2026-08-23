@@ -1,6 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">AR Touchpad</string>
-    <string name="service_label">AR Touchpad Controller</string>
-    <string name="accessibility_service_description">Injects touch gestures on connected displays so your phone screen acts as a trackpad for Android desktop mode.</string>
 </resources>
