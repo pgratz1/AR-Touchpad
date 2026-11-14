@@ -49,8 +49,13 @@ class MouseService : IMouseService.Stub() {
     // to zero every frame and producing sudden jumps.
     private var accumX = 0f
     private var accumY = 0f
+    // Scroll accumulators, in high-resolution wheel units (120 per detent): the fractional
+    // remainder not yet emitted as REL_*WHEEL_HI_RES, and the whole units emitted since the
+    // last legacy REL_WHEEL/REL_HWHEEL detent.
     private var accumScrollX = 0f
     private var accumScrollY = 0f
+    private var detentUnitsX = 0
+    private var detentUnitsY = 0
 
     // Reflection handles for display-targeted key injection and device-display association.
     // injectInputEvent(event, mode) on InputManagerGlobal respects the displayId
@@ -134,7 +139,7 @@ class MouseService : IMouseService.Stub() {
         initUinput()
     }
 
-    // Opens /dev/uinput via JNI, declares mouse capabilities (REL_X/Y, wheel, buttons),
+    // Opens /dev/uinput via JNI, declares mouse capabilities (REL_X/Y, wheel incl. hi-res, buttons),
     // writes the device name, and issues UI_DEV_CREATE. Waits 400 ms for InputReader to
     // enumerate the new device before marking uinputReady = true.
     private fun initUinput() {
@@ -154,6 +159,8 @@ class MouseService : IMouseService.Stub() {
             ioctl(UI_SET_RELBIT, REL_Y)
             ioctl(UI_SET_RELBIT, REL_WHEEL)
             ioctl(UI_SET_RELBIT, REL_HWHEEL)
+            ioctl(UI_SET_RELBIT, REL_WHEEL_HI_RES)
+            ioctl(UI_SET_RELBIT, REL_HWHEEL_HI_RES)
             ioctl(UI_SET_KEYBIT, BTN_LEFT)
             ioctl(UI_SET_KEYBIT, BTN_RIGHT)
             ioctl(UI_SET_KEYBIT, BTN_MIDDLE)
@@ -264,6 +271,8 @@ class MouseService : IMouseService.Stub() {
         accumY = 0f
         accumScrollX = 0f
         accumScrollY = 0f
+        detentUnitsX = 0
+        detentUnitsY = 0
 
         // Pin the uinput device to this display so cursor movement lands on the glasses screen.
         // Without this, Android may default the virtual mouse to the phone's display on some setups.
@@ -364,21 +373,44 @@ class MouseService : IMouseService.Stub() {
         }
     }
 
-    // Input: (dx, dy) finger-pixel deltas (positive = fingers moving right/down).
-    // Converts each axis to wheel detents at 20 px/detent using accumScrollX/Y; emits
-    // REL_WHEEL/REL_HWHEEL only for whole detents, carrying sub-detent remainders forward.
+    // Input: (dx, dy) in finger pixels, as the distance the view should scroll right/down
+    // (the ViewModel has already applied speed and the natural-scroll direction).
+    // The two wheel axes have opposite sign conventions in the kernel — REL_WHEEL is positive
+    // for "up", REL_HWHEEL is positive for "right" — so dy is negated and dx is not. Negating
+    // both, as this once did, makes horizontal scrolling run backwards relative to vertical.
+    // Emits high-resolution wheel events (REL_WHEEL_HI_RES / REL_HWHEEL_HI_RES, 120 units per
+    // detent) so the content follows the fingers in 1/120-detent steps on both axes, instead
+    // of jumping a whole wheel notch every SCROLL_PX_PER_DETENT of travel. As a real hi-res
+    // mouse does, it also emits the legacy REL_WHEEL / REL_HWHEEL each time a full detent of
+    // hi-res units has accumulated: InputReader uses the hi-res axis and ignores the legacy
+    // one when the device declares both, and builds without hi-res support do the reverse.
     override fun scroll(dx: Float, dy: Float) {
         if (!uinputReady) return
-        // 20px of finger movement = 1 wheel detent (adjustable via scrollSpeed in ViewModel).
-        accumScrollX += dx / 20f
-        accumScrollY += dy / 20f
-        val stepsX = accumScrollX.toInt()
-        val stepsY = accumScrollY.toInt()
-        if (stepsX == 0 && stepsY == 0) return
-        accumScrollX -= stepsX
-        accumScrollY -= stepsY
-        if (stepsY != 0) ev(EV_REL, REL_WHEEL, -stepsY)
-        if (stepsX != 0) ev(EV_REL, REL_HWHEEL, -stepsX)
+        accumScrollX += dx * HI_RES_UNITS_PER_PX
+        accumScrollY += dy * HI_RES_UNITS_PER_PX
+        val unitsX = accumScrollX.toInt()
+        val unitsY = accumScrollY.toInt()
+        if (unitsX == 0 && unitsY == 0) return
+        accumScrollX -= unitsX
+        accumScrollY -= unitsY
+        if (unitsY != 0) {
+            ev(EV_REL, REL_WHEEL_HI_RES, -unitsY)
+            detentUnitsY -= unitsY
+            val detents = detentUnitsY / HI_RES_UNITS_PER_DETENT
+            if (detents != 0) {
+                detentUnitsY -= detents * HI_RES_UNITS_PER_DETENT
+                ev(EV_REL, REL_WHEEL, detents)
+            }
+        }
+        if (unitsX != 0) {
+            ev(EV_REL, REL_HWHEEL_HI_RES, unitsX)
+            detentUnitsX += unitsX
+            val detents = detentUnitsX / HI_RES_UNITS_PER_DETENT
+            if (detents != 0) {
+                detentUnitsX -= detents * HI_RES_UNITS_PER_DETENT
+                ev(EV_REL, REL_HWHEEL, detents)
+            }
+        }
         sync()
     }
 
@@ -510,6 +542,13 @@ class MouseService : IMouseService.Stub() {
 
         const val EV_SYN = 0; const val EV_KEY = 1; const val EV_REL = 2
         const val REL_X = 0; const val REL_Y = 1; const val REL_HWHEEL = 6; const val REL_WHEEL = 8
+        const val REL_WHEEL_HI_RES = 0x0b; const val REL_HWHEEL_HI_RES = 0x0c
+
+        // Kernel convention: 120 hi-res wheel units make one detent (notch).
+        const val HI_RES_UNITS_PER_DETENT = 120
+        // 20 px of finger travel = 1 wheel detent, before the ViewModel's scrollSpeed factor.
+        private const val SCROLL_PX_PER_DETENT = 20f
+        private const val HI_RES_UNITS_PER_PX = HI_RES_UNITS_PER_DETENT / SCROLL_PX_PER_DETENT
         const val BTN_LEFT = 0x110; const val BTN_RIGHT = 0x111; const val BTN_MIDDLE = 0x112
         const val KEY_BACK = 158; const val KEY_HOME = 102; const val KEY_APPSWITCH = 580
         const val SYN_REPORT = 0

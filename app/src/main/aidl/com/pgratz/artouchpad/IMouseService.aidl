@@ -27,8 +27,8 @@ interface IMouseService {
     // button: MotionEvent.BUTTON_PRIMARY (left) or BUTTON_SECONDARY (right).
     void click(float x, float y, int button) = 3;
 
-    // Scrolls the content under the cursor by (dx, dy) finger-pixel deltas.
-    // dy is converted to REL_WHEEL detents, dx to REL_HWHEEL detents.
+    // Scrolls the view under the cursor right/down by (dx, dy), in finger-pixel units.
+    // dy becomes vertical wheel motion, dx horizontal, both in 1/120-detent hi-res units.
     void scroll(float dx, float dy) = 4;
 
     // Injects a key press+release for the given Android keycode (e.g. KEYCODE_BACK = 4)

@@ -64,6 +64,9 @@ class MainActivity : ComponentActivity() {
     private var isDimmed by mutableStateOf(false)
     private var pointerDown = false
 
+    // FLAG_KEEP_SCREEN_ON only covers the phone's own display; this covers the glasses.
+    private val glassesWakeLock by lazy { DisplayWakeLock(applicationContext) }
+
     // A finger resting motionless emits no ACTION_MOVE, so a long press or a paused drag
     // looks identical to idleness. Defer while any pointer is still down rather than
     // dimming out from under an in-flight gesture.
@@ -94,6 +97,20 @@ class MainActivity : ComponentActivity() {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 viewModel.state.map { it.dimDelaySec }.distinctUntilChanged().collect {
                     noteInteraction()
+                }
+            }
+        }
+        // Hold the glasses awake for as long as the touchpad is showing, following the target
+        // display as it comes and goes (its id changes on every replug). Released when the
+        // touchpad leaves the screen, so both displays fall back to their normal timeout.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                try {
+                    viewModel.state.map { it.targetDisplay?.id }.distinctUntilChanged().collect {
+                        glassesWakeLock.holdFor(it)
+                    }
+                } finally {
+                    glassesWakeLock.release()
                 }
             }
         }

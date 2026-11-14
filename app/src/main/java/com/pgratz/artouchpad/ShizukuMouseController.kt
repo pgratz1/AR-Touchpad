@@ -18,6 +18,7 @@ import android.content.ComponentName
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.IBinder
+import android.os.SystemClock
 import android.view.MotionEvent
 import rikka.shizuku.Shizuku
 
@@ -31,13 +32,16 @@ class ShizukuMouseController {
     private var lastMoveMs = 0L
     private var pendingDx = 0f
     private var pendingDy = 0f
+    private var lastScrollMs = 0L
+    private var pendingScrollX = 0f
+    private var pendingScrollY = 0f
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.pgratz.artouchpad", MouseService::class.java.name)
     )
         .processNameSuffix("mouse")
         .daemon(false)
-        .version(17)  // bumped — setImePolicy for DeX-style phone-side keyboard
+        .version(18)  // bumped — uinput device now declares hi-res wheel axes
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -136,9 +140,30 @@ class ShizukuMouseController {
         }
     }
 
-    // Forwards scroll deltas (finger pixels) to MouseService for wheel-detent conversion.
+    // Forwards scroll deltas (finger pixels) to MouseService for wheel conversion, paced like
+    // moveMouse and smoothed: each interval sends SCROLL_SMOOTHING of the distance waiting and
+    // carries the rest forward. Fingertip jitter on a slow scroll is larger than the motion
+    // itself, and unsmoothed it reaches the app as a stutter of tiny forward and backward
+    // wheel steps. Nothing is lost — the remainder goes out on later intervals, and
+    // flushScroll() sends what is left when the gesture ends.
     fun scroll(dx: Float, dy: Float) {
-        runCatching { service?.scroll(dx, dy) }
+        pendingScrollX += dx
+        pendingScrollY += dy
+        val now = SystemClock.uptimeMillis()
+        if (now - lastScrollMs < 16L) return
+        lastScrollMs = now
+        val sendX = pendingScrollX * SCROLL_SMOOTHING
+        val sendY = pendingScrollY * SCROLL_SMOOTHING
+        pendingScrollX -= sendX; pendingScrollY -= sendY
+        runCatching { service?.scroll(sendX, sendY) }
+    }
+
+    // Sends whatever scroll distance is still being held back.
+    fun flushScroll() {
+        if (pendingScrollX == 0f && pendingScrollY == 0f) return
+        val sendX = pendingScrollX; val sendY = pendingScrollY
+        pendingScrollX = 0f; pendingScrollY = 0f
+        runCatching { service?.scroll(sendX, sendY) }
     }
 
     // Injects an Android keycode (e.g. KEYCODE_BACK) targeted at the glasses display.
@@ -171,4 +196,9 @@ class ShizukuMouseController {
     // Returns false if the service isn't bound or the wm command isn't supported on this build.
     fun setImePolicy(displayId: Int, policy: Int): Boolean =
         runCatching { service?.setImePolicy(displayId, policy) ?: false }.getOrDefault(false)
+
+    private companion object {
+        // Share of the pending scroll distance sent per ~16 ms interval; the rest is carried.
+        const val SCROLL_SMOOTHING = 0.4f
+    }
 }

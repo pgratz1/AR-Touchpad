@@ -42,6 +42,7 @@ import com.pgratz.artouchpad.DisplayInfo
 import com.pgratz.artouchpad.TouchMode
 import com.pgratz.artouchpad.TouchpadViewModel
 import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.sqrt
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
@@ -60,6 +61,8 @@ private val TEXT_MUTED = Color(0xFF546E7A)
 private val NAV_ICON = Color(0xFFB0BEC5)
 
 private const val MOVE_THRESHOLD = 5f
+// Combined travel (px) two fingers must cover before the gesture is latched as scroll or pinch.
+private const val TWO_FINGER_SLOP = 12f
 private const val TAP_MAX_MS = 220L
 private const val LONG_PRESS_MS = 600L
 private const val DOUBLE_TAP_WINDOW_MS = 300L
@@ -204,8 +207,11 @@ private fun StatusDot(active: Boolean, label: String) {
 // The main touch surface. Intercepts raw pointer events with a single pointerInput handler:
 //   1 finger: tap (click), double-tap, long-press (right-click), long-press+drag (select text),
 //             or drag (cursor move).
-//   2 fingers: pinch (spread > translate → font zoom) or drag (translate > spread → scroll).
+//   2 fingers: pinch (spread > translate → zoom) or drag (translate > spread → scroll),
+//             decided once per gesture after TWO_FINGER_SLOP of travel.
 // Renders a dot grid and live touch point indicators on a Canvas.
+private enum class TwoFingerMode { UNDECIDED, SCROLL, PINCH }
+
 @Composable
 private fun TouchpadSurface(
     modifier: Modifier,
@@ -243,6 +249,10 @@ private fun TouchpadSurface(
                     var isLongPress = false
                     var isSelectMode = false
                     var longPressJob: Job? = null
+                    var twoFingerMode = TwoFingerMode.UNDECIDED
+                    var pendingDx = 0f
+                    var pendingDy = 0f
+                    var pendingSpan = 0f
 
                     coroutineScope {
                         val scope = this  // CoroutineScope for launching the long-press timer
@@ -320,6 +330,13 @@ private fun TouchpadSurface(
                                         longPressJob?.cancel()
 
                                         val newPositions = pressed.associate { it.id to it.position }
+                                        if (lastPositions.size != 2) {
+                                            // Second finger just landed: a new two-finger gesture.
+                                            twoFingerMode = TwoFingerMode.UNDECIDED
+                                            pendingDx = 0f; pendingDy = 0f; pendingSpan = 0f
+                                            // Two fingers down is never a tap, however still they are held.
+                                            didMove = true
+                                        }
                                         if (lastPositions.size == 2) {
                                             val ids = pressed.map { it.id }
                                             val p0prev = lastPositions[ids[0]]
@@ -334,14 +351,33 @@ private fun TouchpadSurface(
                                                 val prevSpan = sqrt(pdx * pdx + pdy * pdy)
                                                 val currSpan = sqrt(cdx * cdx + cdy * cdy)
                                                 val dSpan = currSpan - prevSpan
-                                                // When fingers spread/contract more than they translate, it's a pinch.
-                                                // Otherwise treat as scroll.
-                                                if (abs(dSpan) > abs(dx) + abs(dy)) {
-                                                    if (dSpan != 0f) { onPinch(dSpan); didMove = true }
-                                                } else if (dx != 0f || dy != 0f) {
-                                                    onScroll(dx, dy)
-                                                    onTouchModeChanged(TouchMode.SCROLL)
-                                                    didMove = true
+                                                when (twoFingerMode) {
+                                                    TwoFingerMode.UNDECIDED -> {
+                                                        // Decide once, on travel accumulated since the second
+                                                        // finger landed, then stay decided until a finger lifts.
+                                                        // Judging each frame on its own is wrong: at 120 Hz a slow
+                                                        // scroll moves under 1 px per frame, less than the jitter
+                                                        // in the gap between two fingertips, so a third of the
+                                                        // frames would be mistaken for a pinch and dropped.
+                                                        pendingDx += dx; pendingDy += dy; pendingSpan += dSpan
+                                                        val travel = sqrt(pendingDx * pendingDx + pendingDy * pendingDy)
+                                                        if (max(travel, abs(pendingSpan)) >= TWO_FINGER_SLOP) {
+                                                            // The travel that got us here is forwarded, not discarded.
+                                                            if (abs(pendingSpan) > travel) {
+                                                                twoFingerMode = TwoFingerMode.PINCH
+                                                                onPinch(pendingSpan)
+                                                            } else {
+                                                                twoFingerMode = TwoFingerMode.SCROLL
+                                                                onScroll(pendingDx, pendingDy)
+                                                                onTouchModeChanged(TouchMode.SCROLL)
+                                                            }
+                                                        }
+                                                    }
+                                                    TwoFingerMode.SCROLL -> if (dx != 0f || dy != 0f) {
+                                                        onScroll(dx, dy)
+                                                        onTouchModeChanged(TouchMode.SCROLL)
+                                                    }
+                                                    TwoFingerMode.PINCH -> if (dSpan != 0f) onPinch(dSpan)
                                                 }
                                             }
                                         }

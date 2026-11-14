@@ -51,7 +51,7 @@ data class TouchpadState(
     val cursorY: Float = 0f,
     val sensitivity: Float = 0.5f,
     val scrollSpeed: Float = 0.8f,
-    val naturalScroll: Boolean = false,
+    val naturalScroll: Boolean = true,
     val showSettings: Boolean = false,
     val touchMode: TouchMode = TouchMode.IDLE,
     // Seconds of no input before MainActivity scrims the touchpad UI. 0 = never dim.
@@ -74,7 +74,7 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
     private val _state = MutableStateFlow(TouchpadState(
         sensitivity = prefs.getFloat("sensitivity", 0.5f),
         scrollSpeed = prefs.getFloat("scroll_speed", 0.8f),
-        naturalScroll = prefs.getBoolean("natural_scroll", false),
+        naturalScroll = prefs.getBoolean("natural_scroll", true),
         dimDelaySec = prefs.getInt("dim_delay_sec", DEFAULT_DIM_DELAY_SEC),
         dexKeyboardEnabled = prefs.getBoolean("dex_keyboard", true),
     ))
@@ -82,6 +82,11 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
 
     private val displayManager = app.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
     val mouse = ShizukuMouseController()
+
+    private companion object {
+        const val PINCH_PX_PER_NOTCH = 200f
+        const val PINCH_STEP_PX = 20f
+    }
 
     private var pinchAccum = 0f
     private var smoothDx = 0f
@@ -195,6 +200,8 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
     // Resets the smoothing filter on IDLE so the decaying tail doesn't bleed into the next touch.
     fun setTouchMode(mode: TouchMode) {
         if (mode == TouchMode.IDLE) { smoothDx = 0f; smoothDy = 0f }
+        // The scroll gesture is over: send the tail still held back by the IPC pacing.
+        if (mode != TouchMode.SCROLL) mouse.flushScroll()
         _state.update { it.copy(touchMode = mode) }
     }
 
@@ -213,11 +220,12 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
         mouse.pressKeyWithCtrl(android.view.KeyEvent.KEYCODE_C)
     }
 
-    // Applies scrollSpeed multiplier and natural-scroll direction inversion, then
-    // forwards the adjusted delta to MouseService for wheel-detent conversion.
+    // Turns finger travel into the distance the view should scroll, scaled by scrollSpeed.
+    // Natural scroll (the default): content follows the fingers, so fingers moving down/right
+    // scroll the view up/left. Off: the view scrolls the way the fingers move, like a wheel.
     fun performScroll(dx: Float, dy: Float) {
         val speed = _state.value.scrollSpeed
-        val dir = if (_state.value.naturalScroll) 1f else -1f
+        val dir = if (_state.value.naturalScroll) -1f else 1f
         mouse.scroll(dx * speed * dir, dy * speed * dir)
         _state.update { it.copy(touchMode = TouchMode.SCROLL) }
     }
@@ -228,14 +236,15 @@ class TouchpadViewModel(app: Application) : AndroidViewModel(app) {
     fun typeText(text: String) = mouse.typeText(text)
 
     // Input: dDist — span change in pixels this frame (positive = spreading = zoom in).
-    // Accumulates until 200 px threshold to avoid jitter; each 200 px = 1 AXIS_VSCROLL detent,
-    // which Chrome/WebView maps to one zoom step (~10%) without affecting the system font scale.
+    // 200 px of spread is one wheel notch of Ctrl+scroll (about 10 % zoom), sent in
+    // PINCH_STEP_PX slices as fractions of a notch so the zoom tracks the fingers instead
+    // of jumping a whole notch at a time. Content-level zoom; the system font scale is untouched.
     fun pinchZoom(dDist: Float) {
         pinchAccum += dDist
-        val detents = (pinchAccum / 200f).toInt()
-        if (detents != 0) {
-            pinchAccum -= detents * 200f
-            mouse.ctrlScroll(detents.toFloat())
+        val steps = (pinchAccum / PINCH_STEP_PX).toInt()
+        if (steps != 0) {
+            pinchAccum -= steps * PINCH_STEP_PX
+            mouse.ctrlScroll(steps * PINCH_STEP_PX / PINCH_PX_PER_NOTCH)
         }
     }
 
